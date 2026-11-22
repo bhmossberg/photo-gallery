@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Photo Gallery | Buffalo</title>
+  <meta name="description" content="Buffalo's photo gallery: snapshots from the shop, the brew kettle and everywhere in between.">
+  <meta name="robots" content="noindex">
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; min-height: 100vh; }
+    h1 { text-align: center; color: #fff; margin-bottom: 6px; font-weight: 500; font-size: 1.8rem; }
+    .meta { text-align: center; color: #888; font-size: 0.85rem; margin-bottom: 20px; }
+    .meta button { font: inherit; color: #ddd; background: #222; border: 1px solid #444; border-radius: 999px; padding: 3px 12px; margin-left: 8px; cursor: pointer; }
+    .meta button:hover { background: #333; }
+    .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; max-width: 1200px; margin: 0 auto; }
+    .tile { position: relative; display: block; border: 0; padding: 0; cursor: zoom-in; overflow: hidden; border-radius: 12px; aspect-ratio: 1; background: #222; box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+    .tile img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .4s ease, opacity .4s ease; opacity: 0; }
+    .tile img.ok { opacity: 1; }
+    .tile:hover img, .tile:focus-visible img { transform: scale(1.04); }
+    .tile:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+    .empty { grid-column: 1 / -1; text-align: center; color: #777; padding: 60px 0; }
+    /* lightbox */
+    .lb { position: fixed; inset: 0; background: rgba(0,0,0,.94); display: none; align-items: center; justify-content: center; z-index: 10; touch-action: pan-y; }
+    .lb.open { display: flex; }
+    .lb img { max-width: 94vw; max-height: 86vh; object-fit: contain; border-radius: 6px; box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+    .lb .cap { position: absolute; bottom: 14px; left: 0; right: 0; text-align: center; color: #aaa; font-size: 0.85rem; }
+    .lb button { position: absolute; background: rgba(255,255,255,.08); color: #fff; border: 0; cursor: pointer; font-size: 1.6rem; line-height: 1; width: 48px; height: 48px; border-radius: 50%; }
+    .lb button:hover { background: rgba(255,255,255,.2); }
+    .lb .x { top: 14px; right: 14px; }
+    .lb .play { top: 14px; left: 14px; font-size: 1rem; }
+    .lb .prev { left: 14px; top: 50%; transform: translateY(-50%); }
+    .lb .next { right: 14px; top: 50%; transform: translateY(-50%); }
+    @media (max-width: 600px) {
+      body { padding: 12px; }
+      .gallery { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+      .lb .prev, .lb .next { top: auto; bottom: 40px; transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <h1>Photo Gallery</h1>
+  <p class="meta"><span id="count">Loading…</span> <button type="button" id="shuffle" hidden>Shuffle</button></p>
+  <div class="gallery" id="gallery"></div>
+
+  <div class="lb" id="lb" role="dialog" aria-modal="true" aria-label="Photo viewer">
+    <button type="button" class="x" id="lbClose" aria-label="Close">&times;</button>
+    <button type="button" class="play" id="lbPlay" aria-label="Slideshow">&#9654;</button>
+    <button type="button" class="prev" id="lbPrev" aria-label="Previous photo">&#8249;</button>
+    <img id="lbImg" alt="">
+    <button type="button" class="next" id="lbNext" aria-label="Next photo">&#8250;</button>
+    <div class="cap" id="lbCap"></div>
+  </div>
+
+  <script>
+  (function () {
+    // gallery.json is rebuilt automatically every 5 minutes by ~/site-tools/gallery-sync.py (buffalo's crontab).
+    var grid = document.getElementById('gallery'), count = document.getElementById('count');
+    var lb = document.getElementById('lb'), lbImg = document.getElementById('lbImg'), lbCap = document.getElementById('lbCap');
+    var photos = [], cur = 0, timer = null;
+    function url(p, key) { return p[key].split('/').map(encodeURIComponent).join('/') + '?v=' + (p.v || 0); }
+    function nice(d) {
+      var t = new Date(d); if (isNaN(t)) return '';
+      return t.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+    }
+    // Thumbnails load lazily (as they near the screen) and at most 4 at a time, retrying with
+    // a back-off, so a fast scroll doesn't trip the server's per-visitor rate limit.
+    var queue = [], active = 0, MAX = 4;
+    function pump() {
+      while (active < MAX && queue.length) {
+        (function (im) {
+          active++;
+          var done = function (ok) {
+            im.removeEventListener('load', onload); im.removeEventListener('error', onerr); active--;
+            if (!ok) {
+              var n = (+im.dataset.tries || 0) + 1; im.dataset.tries = n;
+              if (n <= 5) setTimeout(function () { queue.push(im); pump(); }, 1200 * n);
+            }
+            pump();
+          };
+          var onload = function () { done(true); }, onerr = function () { done(false); };
+          im.addEventListener('load', onload); im.addEventListener('error', onerr);
+          im.src = im.dataset.src + (im.dataset.tries ? '&r=' + im.dataset.tries : '');
+        })(queue.shift());
+      }
+    }
+    function enqueue(im) { queue.push(im); pump(); }
+    var io = 'IntersectionObserver' in window ? new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) { io.unobserve(e.target); enqueue(e.target); } });
+    }, { rootMargin: '300px 0px' }) : null;
+    function render() {
+      grid.textContent = ''; queue = [];
+      if (io) io.disconnect();
+      if (!photos.length) { var e = document.createElement('p'); e.className = 'empty'; e.textContent = 'No photos yet.'; grid.appendChild(e); }
+      photos.forEach(function (p, i) {
+        var b = document.createElement('button'); b.type = 'button'; b.className = 'tile';
+        b.setAttribute('aria-label', 'Open photo' + (p.date ? ' from ' + nice(p.date) : ''));
+        var im = document.createElement('img');
+        im.decoding = 'async'; im.alt = '';
+        im.width = 480; im.height = Math.round(480 * p.h / p.w);
+        im.dataset.src = url(p, 'thumb');
+        im.addEventListener('load', function () { im.classList.add('ok'); });
+        b.appendChild(im); b.addEventListener('click', function () { open(i); });
+        grid.appendChild(b);
+        if (io) io.observe(im); else enqueue(im);
+      });
+      count.textContent = photos.length + (photos.length === 1 ? ' photo' : ' photos');
+      document.getElementById('shuffle').hidden = photos.length < 2;
+    }
+    function show(i) {
+      cur = (i + photos.length) % photos.length; var p = photos[cur];
+      lbImg.src = url(p, 'src'); lbCap.textContent = (nice(p.date) ? nice(p.date) + ' · ' : '') + (cur + 1) + ' / ' + photos.length;
+      var n = photos[(cur + 1) % photos.length]; if (n) { var pre = new Image(); pre.src = url(n, 'src'); }
+    }
+    function open(i) { show(i); lb.classList.add('open'); document.body.style.overflow = 'hidden'; document.getElementById('lbClose').focus(); }
+    function close() { lb.classList.remove('open'); document.body.style.overflow = ''; stop(); lbImg.removeAttribute('src'); }
+    function stop() { if (timer) { clearInterval(timer); timer = null; document.getElementById('lbPlay').innerHTML = '&#9654;'; } }
+    function play() { if (timer) return stop(); timer = setInterval(function () { show(cur + 1); }, 5000); document.getElementById('lbPlay').innerHTML = '&#10074;&#10074;'; }
+    document.getElementById('lbClose').addEventListener('click', close);
+    document.getElementById('lbPrev').addEventListener('click', function () { stop(); show(cur - 1); });
+    document.getElementById('lbNext').addEventListener('click', function () { stop(); show(cur + 1); });
+    document.getElementById('lbPlay').addEventListener('click', play);
+    lb.addEventListener('click', function (e) { if (e.target === lb) close(); });
+    document.addEventListener('keydown', function (e) {
+      if (!lb.classList.contains('open')) return;
+      if (e.key === 'Escape') close(); else if (e.key === 'ArrowRight') { stop(); show(cur + 1); } else if (e.key === 'ArrowLeft') { stop(); show(cur - 1); }
+    });
+    var sx = null;
+    lb.addEventListener('touchstart', function (e) { sx = e.touches[0].clientX; }, { passive: true });
+    lb.addEventListener('touchend', function (e) { if (sx === null) return; var dx = e.changedTouches[0].clientX - sx; sx = null; if (Math.abs(dx) > 50) { stop(); show(cur + (dx < 0 ? 1 : -1)); } });
+    document.getElementById('shuffle').addEventListener('click', function () {
+      for (var i = photos.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = photos[i]; photos[i] = photos[j]; photos[j] = t; }
+      render();
+    });
+    fetch('gallery.json', { cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+      .then(function (d) { photos = (d && d.photos) || []; render(); })
+      .catch(function () { count.textContent = 'The photo list could not be loaded. Try again in a minute.'; });
+  })();
+  </script>
+</body>
+</html>
